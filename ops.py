@@ -1,5 +1,15 @@
 import tensorflow as tf
 
+# INPUT: x is K x M
+#        is_test is a boolean which decided whether copies are actually added
+#        N is the number of mc samples to add
+# OUTPUT: y is K x N x M, with N copies along of x along that dimension
+def add_mc_samples(x, N, name='AddMCSamples'):
+    with tf.variable_scope(name):
+        x = tf.expand_dims(x, axis=1)
+        y = tf.tile(x, [1, N, 1])
+        return y
+
 # INPUT: x is K x N x M
 # Performs dropout on the input, with the same M x W dropout mask across the N
 # dimension. Then rehsapes to (MN x W) and computes x*W + b
@@ -9,20 +19,24 @@ def dense_with_dropout(x, output_size, prob, weight_reg=0,
                        nonlinearity=(lambda x: x), is_test=False, stddev=0.05,
                        bias_start=0.0, name='DenseDropout'):
     with tf.variable_scope(name):
-        (K,N,M) = x.get_shape().as_list()
-        test_noise_shape = [1,N,M]
+        # (K,N,M) = x.get_shape().as_list()
+        # test_noise_shape = [1,N,M]
+        x_shape = tf.shape(x)
+        K = x_shape[0]
+        N = x_shape[1]
+        M = x_shape[2]
 
-        W = tf.get_variable("W", [M, output_size], tf.float32,
+        M_int = x.get_shape().as_list()[2]
+
+        W = tf.get_variable("W", [M_int, output_size], tf.float32,
                         initializer=tf.random_normal_initializer(stddev=stddev))
         b = tf.get_variable("b", [output_size],
                         initializer=tf.constant_initializer(bias_start))
 
-        h1 = tf.cond(is_test, lambda: tf.nn.dropout(x, keep_prob=1-prob, noise_shape=test_noise_shape),
-                              lambda: tf.nn.dropout(x, keep_prob=1-prob))
-
-        h1 = tf.reshape(h1, (-1, M))
+        h1 = tf.nn.dropout(x, keep_prob=1-prob, noise_shape=[1, N, M])
+        h1 = tf.reshape(h1, (K*N, M))
         y = nonlinearity(tf.matmul(h1, W) + b)
-        y = tf.reshape(y, (-1, N, output_size))
+        y = tf.reshape(y, (K, N, output_size))
 
         reg_loss = weight_reg * tf.reduce_sum(W**2) / (1. - prob)
 
@@ -55,31 +69,37 @@ def concrete_dropout(x, p, noise_shape=None, temp=0.1):
 #         reg_loss is a scalar corresponding to a regularization loss term
 def dense_with_concrete_dropout(x, output_size, nonlinearity=(lambda x: x),
                                 weight_reg = 0,
-                                dropout_reg =1e-5,
+                                dropout_reg = 1e-5,
                                 is_test=False, stddev=0.05, bias_start=0.0,
                                 name='DenseConcreteDropout'):
     with tf.variable_scope(name):
-        (K,N,M) = x.get_shape().as_list()
-        test_noise_shape = [1,N,M]
+        x_shape = tf.shape(x)
+        K = x_shape[0]
+        N = x_shape[1]
+        M = x_shape[2]
 
-        W = tf.get_variable("W", [M, output_size], tf.float32,
+        M_int = x.get_shape().as_list()[2]
+
+        W = tf.get_variable("W", [M_int, output_size], tf.float32,
                         initializer=tf.random_normal_initializer(stddev=stddev))
         b = tf.get_variable("b", [output_size],
                         initializer=tf.constant_initializer(bias_start))
-        p_logit = tf.get_variable("p", [], tf.float32,
+        p_logit = tf.get_variable("p_logit", [], tf.float32,
                         initializer=tf.random_uniform_initializer(-2., 0.))
 
         p = tf.sigmoid(p_logit)
 
-        h1 = tf.cond(is_test, lambda: concrete_dropout(x, p, noise_shape=test_noise_shape),
-                              lambda: concrete_dropout(x, p))
+        tf.summary.scalar("p", p)
+
+        h1 = concrete_dropout(x, p, noise_shape=[1, N, M])
 
         h1 = tf.reshape(h1, (-1, M))
         y = nonlinearity(tf.matmul(h1, W) + b)
         y = tf.reshape(y, (-1, N, output_size))
 
-        kernel_regularizer = weight_reg * tf.reduce_sum(W**2) / (1. - p)
-        dropout_regularizer = dropout_reg * ( p * tf.log(p) + (1. - p) * tf.log(1. - p) )
+        lengthscale = 1
+        kernel_regularizer = dropout_reg * lengthscale * tf.reduce_sum(W**2) / (1. - p) / 2
+        dropout_regularizer = M_int * dropout_reg * ( p * tf.log(p) + (1. - p) * tf.log(1. - p) )
         reg_loss = kernel_regularizer + dropout_regularizer
 
         return y, reg_loss

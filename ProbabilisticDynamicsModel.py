@@ -16,87 +16,18 @@ class ProbabilisticDynamicsModel:
     def predict(self, x_t, u_t):
         raise NotImplementedError
 
-def nonlinear_mlp(x, u, num_mc_samples, hidden_layer_sizes, dropout_prob, is_test, N_train):
-    x_dim = x.get_shape().as_list()[1]
-    u_dim = u.get_shape().as_list()[1]
-
-    model_input = tf.concat([x, u], axis=1)
-    model_input = tf.expand_dims(model_input, axis=1)
-    model_input = tf.tile(model_input, [1, num_mc_samples, 1])
-
-    log_var_x_next = tf.get_variable("log_var_x_next", [1, 1, x_dim], tf.float32,
-                          tf.constant_initializer(-5.0))
-    dropout_reg = 0 #1e-6 #2*tf.sqrt(tf.reduce_sum(tf.exp(log_var_x_next)))/N_train
-
-    # model_input has shape (K,N,M), corresponding to the K samples input
-    # to the model, N = self.num_mc_samples copies of each input for MC
-    # epistemic uncertainty calculation, and M is the x_dim + u_dim
-    z, reg_loss = mlp_with_dropout(model_input, hidden_layer_sizes, dropout_prob, is_test)
-    # z, reg_loss = mlp_with_concrete_dropout(model_input, hidden_layer_sizes, is_test, dropout_reg=dropout_reg)
-
-    x_reshaped = tf.expand_dims(x, axis=1)
-    x_next_hat, reg_loss2 = dense_with_dropout(z, output_size=x_dim,
-                            prob=dropout_prob, is_test=is_test, name="fc_mean")
-    # x_next_hat, reg_loss2 = dense_with_concrete_dropout(z, output_size=x_dim,
-    #                                                 is_test=is_test, dropout_reg=dropout_reg,
-    #                                                 name="fc_mean")
-    # x_next_hat += x_reshaped
-
-    reg_loss += reg_loss2
-
-    return (x_next_hat, log_var_x_next, reg_loss)
-
-def locally_linear_mlp(x, u, num_mc_samples, hidden_layer_sizes, dropout_prob, is_test, N_train):
-    x_dim = x.get_shape().as_list()[1]
-    u_dim = u.get_shape().as_list()[1]
-    x_tiled = tf.tile(tf.expand_dims(x, axis=1), [1, num_mc_samples, 1])
-    u_tiled = tf.tile(tf.expand_dims(u, axis=1), [1, num_mc_samples, 1])
-    model_input = tf.concat([x_tiled, u_tiled], axis=2)
-
-    # Variance is independent of input (homoscedastic)
-    log_var_x_next = tf.get_variable("log_var_x_next", [1, 1, x_dim], tf.float32,
-                          tf.constant_initializer(-5.0))
-
-    dropout_reg = 0.02*tf.sqrt(tf.reduce_sum(tf.exp(log_var_x_next)))/N_train
-
-    z, reg_loss = mlp_with_dropout(model_input, hidden_layer_sizes, dropout_prob, is_test)
-    # z, reg_loss = mlp_with_concrete_dropout(model_input, hidden_layer_sizes, is_test, dropout_reg=dropout_reg)
-
-    A_dim = x_dim**2
-    B_dim = x_dim*u_dim
-    A_flat, reg_loss_A = dense_with_dropout(z, output_size=A_dim,
-                           prob=dropout_prob, is_test=is_test, name="fc_A")
-    B_flat, reg_loss_B = dense_with_dropout(z, output_size=B_dim,
-                           prob=dropout_prob, is_test=is_test, name="fc_B")
-    # A_flat, reg_loss_A = dense_with_concrete_dropout(z,
-    #                        dropout_reg=dropout_reg, output_size=A_dim,
-    #                        is_test=is_test, name="fc_A")
-    # B_flat, reg_loss_B = dense_with_concrete_dropout(z,
-    #                        dropout_reg=dropout_reg, output_size=B_dim,
-    #                        is_test=is_test, name="fc_B")
-
-    A = tf.reshape(A_flat, [-1, x_dim, x_dim], name="A_into_matrix")
-    B = tf.reshape(B_flat, [-1, x_dim, u_dim], name="B_into_matrix")
-
-    x_reshaped = tf.expand_dims( tf.reshape(x_tiled, [-1, x_dim], name="x_into_matrix"), axis=-1)
-    u_reshaped = tf.expand_dims( tf.reshape(u_tiled, [-1, u_dim], name="u_into_matrix"), axis=-1)
-    x_next_hat = x_reshaped + A @ x_reshaped + B @ u_reshaped
-    x_next_hat = tf.squeeze(x_next_hat, axis=-1)
-    x_next_hat = tf.reshape(x_next_hat, [-1, num_mc_samples, x_dim], name="result_to_batch")
-
-
-    reg_loss += reg_loss_A + reg_loss_B
-    return (x_next_hat, log_var_x_next, reg_loss)
-
 
 MLP_DM_cfg = {
     "lr": 2e-3,
     "beta1": 0.9,
     "batch_size": 100,
+    "val_batch_size": 100,
     "n_epochs": 100,
     "store_val": True
 }
 
+# This class lays out the mechanics for training any transition dyanmics model
+# that predicts a mean vector and log(variance) vector with dropout.
 class MLPDynamicsModel(ProbabilisticDynamicsModel):
     def __init__(self, sess, x_dim, u_dim, hidden_layer_sizes=[64, 64, 64],
                  dropout_prob=0.2, num_mc_samples=50, filename="64_64_64",
@@ -109,23 +40,23 @@ class MLPDynamicsModel(ProbabilisticDynamicsModel):
         self.num_mc_samples = num_mc_samples
         self.filename = filename
         self.writer_path = writer_path
-        self.counter = 1
-        self.pdm_op = locally_linear_mlp
+        self.counter = 0
+
+    # Child classes must define function must set self.x_next_hat and
+    # self.log_var_x_next to be tensors corresponding to the appropriate
+    # calculations performed on the self.x_ and self.u_ placeholders
+    def prediction_model(self):
+        raise NotImplementedError("Subclass must override prediction_model()")
 
     def build_model(self):
-        self.x_ = tf.placeholder(tf.float32, (None, self.x_dim))
-        self.u_ = tf.placeholder(tf.float32, (None, self.u_dim))
-        self.x_next_ = tf.placeholder(tf.float32, (None, self.x_dim))
-        self.is_test = tf.placeholder_with_default(False, [])
-        self.N_train = tf.placeholder(tf.float32, [])
+        self.x_ = tf.placeholder(tf.float32, (None, self.x_dim), name="x")
+        self.u_ = tf.placeholder(tf.float32, (None, self.u_dim), name="u")
+        self.x_next_ = tf.placeholder(tf.float32, (None, self.x_dim), name="x_next")
+        self.is_test = tf.placeholder_with_default(False, [], name="is_test")
+        self.N_train = tf.placeholder(tf.float32, [], name="N_train")
 
-        with tf.variable_scope("MLP_DM"):
-            self.x_next_hat, self.log_var_x_next, self.reg_loss = self.pdm_op(self.x_, self.u_,
-                                                                              self.num_mc_samples,
-                                                                              self.hidden_layer_sizes,
-                                                                              self.dropout_prob,
-                                                                              self.is_test,
-                                                                              self.N_train)
+        with tf.variable_scope("prob_dyn_model"):
+            self.prediction_model()
 
         with tf.variable_scope("Losses_and_Metrics"):
             model_target = tf.expand_dims(self.x_next_, axis=1)
@@ -211,10 +142,11 @@ class MLPDynamicsModel(ProbabilisticDynamicsModel):
                 if cfg["store_val"]:
                     val_loss, summary_str = self.sess.run([self.loss, self.summary],
                                                     feed_dict={
-                                                        self.x_: x_val,
-                                                        self.u_: u_val,
-                                                        self.x_next_: x_next_val,
-                                                        self.N_train : N
+                                                        self.x_: x_val[0:cfg["val_batch_size"],:],
+                                                        self.u_: u_val[0:cfg["val_batch_size"],:],
+                                                        self.x_next_: x_next_val[0:cfg["val_batch_size"],:],
+                                                        self.N_train : N,
+                                                        self.is_test : True
                                                     })
                     self.val_writer.add_summary(summary_str, self.counter)
 
@@ -226,6 +158,9 @@ class MLPDynamicsModel(ProbabilisticDynamicsModel):
                     self.saver.save(self.sess, self.writer_path + '/mlp_dyn_model', global_step=self.counter)
 
                 self.counter += 1
+
+        self.saver.save(self.sess, self.writer_path + '/mlp_dyn_model', global_step=self.counter-1)
+
 
 
     def predict(self, x_t, u_t):
@@ -244,3 +179,76 @@ class MLPDynamicsModel(ProbabilisticDynamicsModel):
             }
 
         return prediction
+
+
+class NonlinearPDM(MLPDynamicsModel):
+    def prediction_model(self):
+        N = tf.cond(self.is_test, lambda: tf.constant(self.num_mc_samples), lambda: tf.constant(1))
+        x = add_mc_samples(self.x_, N)
+        u = add_mc_samples(self.u_, N)
+        model_input = tf.concat([x, u], axis=2)
+
+        self.log_var_x_next = tf.get_variable("log_var_x_next", [1, 1, self.x_dim], tf.float32,
+                              tf.constant_initializer(-5.0))
+        # self.log_var_x_next = -2.0*tf.ones([1,1,self.x_dim])
+
+        #dropout_reg = 2*tf.sqrt(tf.reduce_sum(tf.exp(self.log_var_x_next)))/self.N_train
+        dropout_reg = 2*0.53/self.N_train
+
+        # model_input has shape (K,N,M), corresponding to the K samples input
+        # to the model, N = self.num_mc_samples copies of each input for MC
+        # epistemic uncertainty calculation, and M is the x_dim + u_dim
+        z, reg_loss = mlp_with_dropout(model_input, self.hidden_layer_sizes, self.dropout_prob, self.is_test)
+        # z, reg_loss = mlp_with_concrete_dropout(model_input, self.hidden_layer_sizes, self.is_test, dropout_reg=dropout_reg)
+
+        delta_x, reg_loss2 = dense_with_dropout(z, output_size=self.x_dim,
+                                prob=self.dropout_prob, is_test=self.is_test, name="fc_mean")
+        # delta_x, reg_loss2 = dense_with_concrete_dropout(z, output_size=self.x_dim,
+        #                                                 is_test=self.is_test, dropout_reg=dropout_reg,
+        #                                                 name="fc_mean")
+
+        self.x_next_hat = x + delta_x
+
+        self.reg_loss = reg_loss + reg_loss2
+
+
+class LocallyLinearPDM(MLPDynamicsModel):
+    def prediction_model(self):
+        N = tf.cond(self.is_test, lambda: tf.constant(self.num_mc_samples), lambda: tf.constant(1))
+        x = add_mc_samples(self.x_, N)
+        u = add_mc_samples(self.u_, N)
+        model_input = tf.concat([x, u], axis=2)
+
+        # Variance is independent of input (homoscedastic)
+        self.log_var_x_next = tf.get_variable("log_var_x_next", [1, 1, self.x_dim], tf.float32,
+                                                tf.constant_initializer(-5.0))
+
+        dropout_reg = 2*tf.sqrt(tf.reduce_sum(tf.exp(self.log_var_x_next)))/self.N_train
+
+        # z, reg_loss = mlp_with_dropout(model_input, self.hidden_layer_sizes, self.dropout_prob, self.is_test)
+        z, reg_loss = mlp_with_concrete_dropout(model_input, self.hidden_layer_sizes, self.is_test, dropout_reg=dropout_reg)
+
+        A_dim = self.x_dim**2
+        B_dim = self.x_dim*self.u_dim
+        A_flat, reg_loss_A = dense_with_dropout(z, output_size=A_dim,
+                               prob=self.dropout_prob, is_test=self.is_test, name="fc_A")
+        B_flat, reg_loss_B = dense_with_dropout(z, output_size=B_dim,
+                               prob=self.dropout_prob, is_test=self.is_test, name="fc_B")
+        # A_flat, reg_loss_A = dense_with_concrete_dropout(z,
+        #                        dropout_reg=dropout_reg, output_size=A_dim,
+        #                        is_test=is_test, name="fc_A")
+        # B_flat, reg_loss_B = dense_with_concrete_dropout(z,
+        #                        dropout_reg=dropout_reg, output_size=B_dim,
+        #                        is_test=is_test, name="fc_B")
+
+        self.A = tf.reshape(A_flat, [-1, self.x_dim, self.x_dim], name="A_into_matrix")
+        self.B = tf.reshape(B_flat, [-1, self.x_dim, self.u_dim], name="B_into_matrix")
+
+        x_matrix = tf.expand_dims( tf.reshape(x, [-1, self.x_dim], name="x_into_matrix"), axis=-1)
+        u_matrix = tf.expand_dims( tf.reshape(u, [-1, self.u_dim], name="u_into_matrix"), axis=-1)
+        x_next_hat = x_matrix + self.A @ x_matrix + self.B @ u_matrix
+        x_next_hat = tf.squeeze(x_next_hat, axis=-1)
+        self.x_next_hat = tf.reshape(x_next_hat, [-1, N, self.x_dim], name="result_to_batch")
+
+
+        self.reg_loss = reg_loss + reg_loss_A + reg_loss_B
