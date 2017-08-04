@@ -31,7 +31,7 @@ def dense_with_dropout(x, output_size, prob, weight_reg=0,
         W = tf.get_variable("W", [M_int, output_size], tf.float32,
                         initializer=tf.random_normal_initializer(stddev=stddev))
         b = tf.get_variable("b", [output_size],
-                        initializer=tf.constant_initializer(bias_start))
+                        initializer=tf.random_normal_initializer(mean=bias_start, stddev=stddev))
 
         h1 = tf.nn.dropout(x, keep_prob=1-prob, noise_shape=[1, N, M])
         h1 = tf.reshape(h1, (K*N, M))

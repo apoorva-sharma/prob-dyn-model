@@ -3,6 +3,8 @@ import time
 import tensorflow as tf
 import numpy as np
 import math
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF
 
 from ops import *
 from utils import *
@@ -54,54 +56,63 @@ class MLPDynamicsModel(ProbabilisticDynamicsModel):
         self.x_next_ = tf.placeholder(tf.float32, (None, self.x_dim), name="x_next")
         self.is_test = tf.placeholder_with_default(False, [], name="is_test")
         self.N_train = tf.placeholder(tf.float32, [], name="N_train")
-
-        with tf.variable_scope("prob_dyn_model"):
-            self.prediction_model()
-
-        with tf.variable_scope("Losses_and_Metrics"):
-            model_target = tf.expand_dims(self.x_next_, axis=1)
-            eps = 1e-7
-            mahalanobis_dist = mahalanobis_distance(self.x_next_hat, model_target, tf.exp(self.log_var_x_next))
-            mahalanobis_loss = tf.reduce_mean(mahalanobis_dist)
-            with tf.variable_scope("variance_regularization"):
-                var_reg_loss = tf.reduce_mean( tf.reduce_sum( self.log_var_x_next, axis=2 ) )
-            with tf.variable_scope("l2_loss"):
-                l2_loss = tf.reduce_mean( tf.reduce_sum( (self.x_next_hat - model_target)**2, axis=2 ) )
-
-            self.loss = mahalanobis_loss + var_reg_loss + self.reg_loss
-
-            # Various quantities of interest
-            with tf.variable_scope("prediction_error"):
-                error = tf.reduce_mean(tf.reduce_mean(self.x_next_hat - model_target, axis=2), axis=1)
-
-            aleatoric_unc = tf.reduce_mean(tf.exp(self.log_var_x_next))
-            ep_unc_of_mean = tf.reduce_mean(epistemic_unc(self.x_next_hat))
-            #ep_unc_of_var = tf.reduce_mean(epistemic_unc(self.log_var_x_next))
+        self.lr = tf.placeholder(tf.float32, [], name="lr")
+        self.beta1 = tf.placeholder(tf.float32, [], name="beta1")
 
 
-            # Summaries
-            error_sum = tf.summary.histogram("prediction_error", error)
-            mahalanobis_dist_sum = tf.summary.histogram("mahalanobis_dist", mahalanobis_dist)
-            maha_loss_sum = tf.summary.scalar("mahalanobis_loss", mahalanobis_loss)
-            var_reg_loss_sum = tf.summary.scalar("var_reg_loss", var_reg_loss)
-            l2_loss_sum = tf.summary.scalar("l2_loss", l2_loss)
-            total_loss_sum = tf.summary.scalar("total_loss", self.loss)
-            reg_loss_sum = tf.summary.scalar("regularization_loss", self.reg_loss)
-            aleatoric_unc_sum = tf.summary.scalar("aleatoric_unc", aleatoric_unc)
-            ep_unc_of_mean_sum = tf.summary.scalar("epistemic_unc_of_mean", ep_unc_of_mean)
-            #ep_unc_of_var_sum = tf.summary.scalar("epistemic_unc_of_var", ep_unc_of_var)
-            self.summary = tf.summary.merge_all()
+        with tf.variable_scope(self.name):
+            with tf.variable_scope("Model"):
+                self.prediction_model()
+
+            with tf.variable_scope("Losses_and_Metrics"):
+                model_target = tf.expand_dims(self.x_next_, axis=1)
+                eps = 1e-7
+                mahalanobis_dist = mahalanobis_distance(self.x_next_hat, model_target, tf.exp(self.log_var_x_next))
+                mahalanobis_loss = tf.reduce_mean(mahalanobis_dist)
+                with tf.variable_scope("variance_regularization"):
+                    var_reg_loss = tf.reduce_mean( tf.reduce_sum( self.log_var_x_next, axis=2 ) )
+                with tf.variable_scope("l2_loss"):
+                    l2_loss = tf.reduce_mean( tf.reduce_sum( (self.x_next_hat - model_target)**2, axis=2 ) )
+
+                self.loss = mahalanobis_loss + var_reg_loss + self.reg_loss
+
+                # Various quantities of interest
+                with tf.variable_scope("prediction_error"):
+                    error = tf.reduce_mean(tf.reduce_mean(self.x_next_hat - model_target, axis=2), axis=1)
+
+                aleatoric_unc = tf.reduce_mean(tf.exp(self.log_var_x_next))
+                ep_unc_of_mean = tf.reduce_mean(epistemic_unc(self.x_next_hat))
+                #ep_unc_of_var = tf.reduce_mean(epistemic_unc(self.log_var_x_next))
+
+
+                # Summaries
+                error_sum = tf.summary.histogram("prediction_error", error)
+                mahalanobis_dist_sum = tf.summary.histogram("mahalanobis_dist", mahalanobis_dist)
+                maha_loss_sum = tf.summary.scalar("mahalanobis_loss", mahalanobis_loss)
+                var_reg_loss_sum = tf.summary.scalar("var_reg_loss", var_reg_loss)
+                l2_loss_sum = tf.summary.scalar("l2_loss", l2_loss)
+                total_loss_sum = tf.summary.scalar("total_loss", self.loss)
+                reg_loss_sum = tf.summary.scalar("regularization_loss", self.reg_loss)
+                aleatoric_unc_sum = tf.summary.scalar("aleatoric_unc", aleatoric_unc)
+                ep_unc_of_mean_sum = tf.summary.scalar("epistemic_unc_of_mean", ep_unc_of_mean)
+                #ep_unc_of_var_sum = tf.summary.scalar("epistemic_unc_of_var", ep_unc_of_var)
+                self.summary = tf.summary.merge([error_sum, mahalanobis_dist_sum, maha_loss_sum, var_reg_loss_sum,
+                                                 l2_loss_sum, total_loss_sum, reg_loss_sum, aleatoric_unc_sum, ep_unc_of_mean_sum])
+
+            self.t_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=self.name)
+            self.optim = tf.train.AdamOptimizer(self.lr, beta1=self.beta1
+                                               ).minimize(self.loss, var_list=self.t_vars)
+            self.saver = tf.train.Saver(max_to_keep=2)
+            
             self.train_writer = tf.summary.FileWriter(self.writer_path + "/" + self.filename + '-train', self.sess.graph)
             self.val_writer = tf.summary.FileWriter(self.writer_path + "/" + self.filename + '-val', self.sess.graph)
 
-        self.t_vars = tf.trainable_variables()
-        self.saver = tf.train.Saver(max_to_keep=2)
-
     def train(self, transitions, cfg=MLP_DM_cfg):
-        optim = tf.train.AdamOptimizer(cfg["lr"], beta1=cfg["beta1"]
-                                       ).minimize(self.loss, var_list=self.t_vars)
+        print(  self.name, self.beta1)
 
-        tf.global_variables_initializer().run()
+        tf.variables_initializer(tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=self.name)).run(
+            feed_dict={self.lr : cfg["lr"], self.beta1 : cfg["beta1"]}
+        )
 
         train_trans, val_trans = split_train_val(transitions)
 
@@ -121,20 +132,23 @@ class MLPDynamicsModel(ProbabilisticDynamicsModel):
         start_time = time.time()
 
         for epoch in range(cfg["n_epochs"]):
+            randomized_idx = np.random.permutation(N)
             num_batches = N // cfg["batch_size"]
             for i in range(num_batches):
-                batch_idx = range(i*cfg["batch_size"],(i+1)*cfg["batch_size"])
+                batch_idx = randomized_idx[range(i*cfg["batch_size"],(i+1)*cfg["batch_size"])]
 
                 x_batch = x[batch_idx,:]
                 u_batch = u[batch_idx,:]
                 x_next_batch = x_next[batch_idx,:]
 
-                _, train_loss, summary_str = self.sess.run([optim, self.loss, self.summary],
+                _, train_loss, summary_str = self.sess.run([self.optim, self.loss, self.summary],
                                                 feed_dict={
                                                     self.x_: x_batch,
                                                     self.u_: u_batch,
                                                     self.x_next_: x_next_batch,
-                                                    self.N_train : N
+                                                    self.N_train : N,
+                                                    self.lr : cfg["lr"],
+                                                    self.beta1 : cfg["beta1"]
                                                 })
                 self.train_writer.add_summary(summary_str, self.counter)
 
@@ -182,6 +196,10 @@ class MLPDynamicsModel(ProbabilisticDynamicsModel):
 
 
 class NonlinearPDM(MLPDynamicsModel):
+    def build_model(self):
+        self.name = "nonlinear_pdm"
+        super(NonlinearPDM, self).build_model()
+
     def prediction_model(self):
         N = tf.cond(self.is_test, lambda: tf.constant(self.num_mc_samples), lambda: tf.constant(1))
         x = add_mc_samples(self.x_, N)
@@ -213,6 +231,10 @@ class NonlinearPDM(MLPDynamicsModel):
 
 
 class LocallyLinearPDM(MLPDynamicsModel):
+    def build_model(self):
+        self.name = "locallylinear_pdm"
+        super(LocallyLinearPDM , self).build_model()
+
     def prediction_model(self):
         N = tf.cond(self.is_test, lambda: tf.constant(self.num_mc_samples), lambda: tf.constant(1))
         x = add_mc_samples(self.x_, N)
@@ -225,15 +247,19 @@ class LocallyLinearPDM(MLPDynamicsModel):
 
         dropout_reg = 2*tf.sqrt(tf.reduce_sum(tf.exp(self.log_var_x_next)))/self.N_train
 
-        # z, reg_loss = mlp_with_dropout(model_input, self.hidden_layer_sizes, self.dropout_prob, self.is_test)
-        z, reg_loss = mlp_with_concrete_dropout(model_input, self.hidden_layer_sizes, self.is_test, dropout_reg=dropout_reg)
+        z, reg_loss = mlp_with_dropout(model_input, self.hidden_layer_sizes, self.dropout_prob, self.is_test)
+        # z, reg_loss = mlp_with_concrete_dropout(model_input, self.hidden_layer_sizes, self.is_test, dropout_reg=dropout_reg)
 
         A_dim = self.x_dim**2
         B_dim = self.x_dim*self.u_dim
+        C_dim = self.x_dim
         A_flat, reg_loss_A = dense_with_dropout(z, output_size=A_dim,
                                prob=self.dropout_prob, is_test=self.is_test, name="fc_A")
         B_flat, reg_loss_B = dense_with_dropout(z, output_size=B_dim,
                                prob=self.dropout_prob, is_test=self.is_test, name="fc_B")
+        C_flat, reg_loss_C = dense_with_dropout(z, output_size=C_dim,
+                               prob=self.dropout_prob, is_test=self.is_test, name="fc_C")
+
         # A_flat, reg_loss_A = dense_with_concrete_dropout(z,
         #                        dropout_reg=dropout_reg, output_size=A_dim,
         #                        is_test=is_test, name="fc_A")
@@ -243,12 +269,45 @@ class LocallyLinearPDM(MLPDynamicsModel):
 
         self.A = tf.reshape(A_flat, [-1, self.x_dim, self.x_dim], name="A_into_matrix")
         self.B = tf.reshape(B_flat, [-1, self.x_dim, self.u_dim], name="B_into_matrix")
+        self.C = tf.expand_dims( tf.reshape(C_flat, [-1, self.x_dim], name="C_into_matrix"), axis=-1)
 
         x_matrix = tf.expand_dims( tf.reshape(x, [-1, self.x_dim], name="x_into_matrix"), axis=-1)
         u_matrix = tf.expand_dims( tf.reshape(u, [-1, self.u_dim], name="u_into_matrix"), axis=-1)
-        x_next_hat = x_matrix + self.A @ x_matrix + self.B @ u_matrix
+        x_next_hat = x_matrix + self.A @ x_matrix + self.B @ u_matrix + self.C
         x_next_hat = tf.squeeze(x_next_hat, axis=-1)
         self.x_next_hat = tf.reshape(x_next_hat, [-1, N, self.x_dim], name="result_to_batch")
 
 
         self.reg_loss = reg_loss + reg_loss_A + reg_loss_B
+
+
+class GaussianProcessDM(ProbabilisticDynamicsModel):
+    def __init__(self, length_scale=1):
+        self.kernel = 1**2 * RBF(length_scale=length_scale, length_scale_bounds=(1e-2, 1e3))
+
+    def build_model(self):
+        self.gpr = GaussianProcessRegressor(kernel=self.kernel, alpha=1e-10,
+                                            optimizer='fmin_l_bfgs_b',
+                                            n_restarts_optimizer=0, normalize_y=False,
+                                            copy_X_train=True)
+
+    def assemble_inputs(self, x_t, u_t):
+        return np.concatenate([x_t, u_t], axis=1)
+
+    def train(self, traj, cfg):
+        # fit GP to data in traj
+        X = self.assemble_inputs(traj["x"], traj["u"])
+        y = traj["x_next"]
+        self.gpr.fit(X,y)
+
+    def predict(self, x_t, u_t):
+        X = self.assemble_inputs(x_t, u_t)
+        x_next = self.gpr.sample_y(X, n_samples=50)
+        x_next_mean = np.mean(x_next, axis=2)
+        prediction = {
+            "x": x_next_mean,
+            "aleatoric_unc": np.zeros_like(x_next_mean),
+            "epistemic_unc_of_mean": np.var(x_next, axis=2),
+            "epistemic_unc_of_var": np.zeros_like(x_next_mean)
+        }
+        return prediction

@@ -121,8 +121,11 @@ def sample_transitions_rl(env_name, n_itr, plot=False):
     return transitions
 
 
+color_list = ['#00697D','#70007D','#338030']
+facecolor_list = ['#00DDFF','#DD00FF','#66FF66']
+
 # Generate plots of function over a slice of the state space
-def sample_and_plot_results(env, pdm, x_range, u_range, N=100):
+def sample_and_plot_results(env, pdm_list, x_range, u_range, N=100, labels=None):
     # determine which value to use as the x axis
     key = None
     dim = -1
@@ -142,21 +145,31 @@ def sample_and_plot_results(env, pdm, x_range, u_range, N=100):
         key = "u"
 
     true_transitions = sample_transitions(env, x_range[0,:], x_range[1,:], u_range[0,:], u_range[1,:], N)
-    predictions = pdm.predict(true_transitions["x"], true_transitions["u"])
-
     x = true_transitions[key][:,dim]
     y = true_transitions["x_next"] - true_transitions["x"]
 
-    full_sd = np.sqrt(predictions["aleatoric_unc"] + predictions["epistemic_unc_of_mean"]) #
-
-    y_hat = predictions["x"] - true_transitions["x"]
-    y_plus1 = y_hat + 1*full_sd
-    y_sub1 = y_hat - 1*full_sd
-    y_plus2 = y_hat + 2*full_sd
-    y_sub2 = y_hat - 2*full_sd
-
     # sort data by x axis
     sorted_i = x.argsort()
+
+    # Now, use the PDMs to make predictions over x
+    y_hat = []
+    y_plus1 = []
+    y_plus2 = []
+    y_sub1 = []
+    y_sub2 = []
+    for pdm in pdm_list:
+        predictions = pdm.predict(true_transitions["x"], true_transitions["u"])
+
+        full_sd = np.sqrt(predictions["epistemic_unc_of_mean"]) #predictions["aleatoric_unc"] +
+
+        y_hat.append(  predictions["x"] - true_transitions["x"] )
+        y_plus1.append(  predictions["x"] - true_transitions["x"] + 1*full_sd )
+        y_sub1.append( predictions["x"] - true_transitions["x"] - 1*full_sd )
+        y_plus2.append(  predictions["x"] - true_transitions["x"] + 2*full_sd )
+        y_sub2.append(  predictions["x"] - true_transitions["x"] - 2*full_sd )
+
+    if not labels:
+        labels = [str(i+1) for i in range(len(pdm_list))]
 
     plt.rc('text', usetex=True)
     plt.rc('font', family='serif')
@@ -166,15 +179,25 @@ def sample_and_plot_results(env, pdm, x_range, u_range, N=100):
     K = y.shape[1]
     for k in range(K):
         plt.subplot(K*100 + 10 + k + 1)
-        plt.plot(x[sorted_i], y_hat[sorted_i,k], color='#00697D')
-        plt.fill_between(x[sorted_i], y_sub1[sorted_i,k], y_plus1[sorted_i,k],
-                            alpha=0.5, edgecolor='#00697D', facecolor='#00D7FF')
-        plt.fill_between(x[sorted_i], y_sub2[sorted_i,k], y_plus2[sorted_i,k],
-                            alpha=0.5, edgecolor='#00697D', facecolor='#00D7FF')
-        plt.plot(x[sorted_i], y[sorted_i,k], color='#B25100')
+        legend_handles = []
+        for i in range(len(pdm_list)):
+            handle, = plt.plot(x[sorted_i], y_hat[i][sorted_i,k], color=color_list[i], label=labels[i], linewidth=2)
+            plt.fill_between(x[sorted_i], y_sub1[i][sorted_i,k], y_plus1[i][sorted_i,k],
+                                alpha=0.2, edgecolor=color_list[i], facecolor=facecolor_list[i])
+            plt.fill_between(x[sorted_i], y_sub2[i][sorted_i,k], y_plus2[i][sorted_i,k],
+                                alpha=0.2, edgecolor=color_list[i], facecolor=facecolor_list[i])
+
+            legend_handles.append(handle)
+
+        handle, = plt.plot(x[sorted_i], y[sorted_i,k], color='#000000', label='Ground Truth', linewidth=2)
+        legend_handles.append(handle)
+
+        if k == 0:
+            plt.legend(handles=legend_handles, fontsize=11, loc=4)
         plt.ylabel(r"$\mathbf{x}_" + str(k) + r"(t+1) - \mathbf{x}_" + str(k) + r"(t)$", fontsize=16)
         if k == K - 1:
             plt.xlabel(r"$\mathbf{" + key + r"}_" + str(dim) + r"(t)$", fontsize=16)
         plt.grid(True)
+
 
     plt.show()
